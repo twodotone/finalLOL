@@ -3,4 +3,5 @@ numpy
 xgboost
 scikit-learn
 joblib
-streamlit
+streamlit>=1.42.0
+altair<6.0.0
