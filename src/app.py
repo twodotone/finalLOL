@@ -150,26 +150,43 @@ with tab_predict:
                 a_feats = model_df[model_df['teamid'] == a_id].iloc[-1]
                 b_feats = model_df[model_df['teamid'] == b_id].iloc[-1]
                 
-                x_blue = pd.DataFrame([{
-                    'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1,
-                    # We default to 0 for missing stats on generic lookup, real prod uses full rolling DB
-                    'roll5_opp_elo_pre': a_feats.get('roll5_opp_elo_pre', avg_b),
-                    'roll5_adj_golddiffat15': a_feats.get('roll5_adj_golddiffat15', 0), 
-                    'roll5_adj_xpdiffat15': a_feats.get('roll5_adj_xpdiffat15', 0), 
-                    'roll5_adj_csdiffat15': a_feats.get('roll5_adj_csdiffat15', 0), 
-                    'roll5_adj_firstblood': a_feats.get('roll5_adj_firstblood', 0), 
-                    'roll5_adj_firstdragon': a_feats.get('roll5_adj_firstdragon', 0), 
-                    'roll5_adj_firstherald': a_feats.get('roll5_adj_firstherald', 0), 
-                    'roll5_adj_firsttower': a_feats.get('roll5_adj_firsttower', 0), 
-                    'roll5_adj_firstbaron': a_feats.get('roll5_adj_firstbaron', 0), 
-                    'roll5_adj_dpm': a_feats.get('roll5_adj_dpm', 0), 
-                    'roll5_adj_vspm': a_feats.get('roll5_adj_vspm', 0)
-                }])
+                has_dual_deltas = 'delta5_adj_golddiffat15' in model_df.columns
+                has_single_deltas = 'delta_adj_golddiffat15' in model_df.columns
+                
+                stat_names = ['adj_golddiffat15', 'adj_xpdiffat15', 'adj_csdiffat15',
+                              'adj_firstblood', 'adj_firstdragon', 'adj_firstherald',
+                              'adj_firsttower', 'adj_firstbaron', 'adj_dpm', 'adj_vspm', 'opp_elo_pre']
+                
+                if has_dual_deltas:
+                    row = {'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1}
+                    for s in stat_names:
+                        row[f'delta5_{s}'] = a_feats.get(f'roll5_{s}', 0) - b_feats.get(f'roll5_{s}', 0)
+                        row[f'delta10_{s}'] = a_feats.get(f'roll10_{s}', 0) - b_feats.get(f'roll10_{s}', 0)
+                    x_blue = pd.DataFrame([row])
+                elif has_single_deltas:
+                    row = {'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1}
+                    for s in stat_names:
+                        row[f'delta_{s}'] = a_feats.get(f'roll5_{s}', 0) - b_feats.get(f'roll5_{s}', 0)
+                    x_blue = pd.DataFrame([row])
+                else:
+                    x_blue = pd.DataFrame([{
+                        'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1,
+                        'roll5_opp_elo_pre': a_feats.get('roll5_opp_elo_pre', avg_b),
+                        'roll5_adj_golddiffat15': a_feats.get('roll5_adj_golddiffat15', 0),
+                        'roll5_adj_xpdiffat15': a_feats.get('roll5_adj_xpdiffat15', 0),
+                        'roll5_adj_csdiffat15': a_feats.get('roll5_adj_csdiffat15', 0),
+                        'roll5_adj_firstblood': a_feats.get('roll5_adj_firstblood', 0),
+                        'roll5_adj_firstdragon': a_feats.get('roll5_adj_firstdragon', 0),
+                        'roll5_adj_firstherald': a_feats.get('roll5_adj_firstherald', 0),
+                        'roll5_adj_firsttower': a_feats.get('roll5_adj_firsttower', 0),
+                        'roll5_adj_firstbaron': a_feats.get('roll5_adj_firstbaron', 0),
+                        'roll5_adj_dpm': a_feats.get('roll5_adj_dpm', 0),
+                        'roll5_adj_vspm': a_feats.get('roll5_adj_vspm', 0),
+                    }])
                 
                 x_red = x_blue.copy()
                 x_red['is_blue_side'] = 0
                 
-                # Predict probability of win
                 p_a_ml_blue = ml_model.predict_proba(x_blue)[:, 1][0]
                 p_a_ml_red = ml_model.predict_proba(x_red)[:, 1][0]
                 

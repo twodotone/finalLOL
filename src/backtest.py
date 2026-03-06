@@ -20,12 +20,33 @@ df_feats['is_blue_side'] = (df_feats['side'] == 'Blue').astype(int)
 df = pd.merge(df_feats, match_meta, on=['gameid', 'teamid'], how='inner')
 df = df.sort_values('date')
 
-features = [
-    'team_elo_pre', 'opp_elo_pre', 'expected_win_prob', 'is_blue_side',
-    'roll5_opp_elo_pre', 'roll5_adj_golddiffat15', 'roll5_adj_xpdiffat15', 'roll5_adj_csdiffat15', 
-    'roll5_adj_firstblood', 'roll5_adj_firstdragon', 'roll5_adj_firstherald', 
-    'roll5_adj_firsttower', 'roll5_adj_firstbaron', 'roll5_adj_dpm', 'roll5_adj_vspm'
-]
+# Base ELO + side features
+base_features = ['team_elo_pre', 'opp_elo_pre', 'expected_win_prob', 'is_blue_side']
+
+# Dual-timescale delta features (interleaved: delta5_stat, delta10_stat per stat)
+_stat_names = ['adj_golddiffat15', 'adj_xpdiffat15', 'adj_csdiffat15',
+               'adj_firstblood', 'adj_firstdragon', 'adj_firstherald',
+               'adj_firsttower', 'adj_firstbaron', 'adj_dpm', 'adj_vspm', 'opp_elo_pre']
+delta_features_interleaved = []
+for s in _stat_names:
+    delta_features_interleaved.append(f'delta5_{s}')
+    delta_features_interleaved.append(f'delta10_{s}')
+
+available_cols = set(df_feats.columns)
+dual_available = all(c in available_cols for c in delta_features_interleaved)
+
+if dual_available:
+    features = base_features + delta_features_interleaved
+    print('Using dual-timescale DELTA features (V3.1 pipeline)')
+else:
+    # Legacy fallback
+    features = base_features + [
+        'roll5_opp_elo_pre', 'roll5_adj_golddiffat15', 'roll5_adj_xpdiffat15', 'roll5_adj_csdiffat15',
+        'roll5_adj_firstblood', 'roll5_adj_firstdragon', 'roll5_adj_firstherald',
+        'roll5_adj_firsttower', 'roll5_adj_firstbaron', 'roll5_adj_dpm', 'roll5_adj_vspm'
+    ]
+    print('Using absolute rolling features (V2 pipeline fallback)')
+
 target = 'result'
 
 # Strict OOS Split

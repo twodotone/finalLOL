@@ -116,37 +116,47 @@ def project_matchup(elo_engine, match_results, players_df, model_df, ml_model, t
             a_feats = model_df[model_df['teamid'] == a_id].iloc[-1]
             b_feats = model_df[model_df['teamid'] == b_id].iloc[-1]
             
-            # Predict Team A win prob assuming Team A is Blue side
-            x_input = pd.DataFrame([{
-                'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1,
-                'roll5_opp_elo_pre': a_feats.get('roll5_opp_elo_pre', avg_b),
-                'roll5_adj_golddiffat15': a_feats.get('roll5_adj_golddiffat15', 0) - b_feats.get('roll5_adj_golddiffat15', 0), 
-                'roll5_adj_xpdiffat15': a_feats.get('roll5_adj_xpdiffat15', 0) - b_feats.get('roll5_adj_xpdiffat15', 0), 
-                'roll5_adj_csdiffat15': a_feats.get('roll5_adj_csdiffat15', 0) - b_feats.get('roll5_adj_csdiffat15', 0), 
-                'roll5_adj_firstblood': a_feats.get('roll5_adj_firstblood', 0) - b_feats.get('roll5_adj_firstblood', 0), 
-                'roll5_adj_firstdragon': a_feats.get('roll5_adj_firstdragon', 0) - b_feats.get('roll5_adj_firstdragon', 0), 
-                'roll5_adj_firstherald': a_feats.get('roll5_adj_firstherald', 0) - b_feats.get('roll5_adj_firstherald', 0), 
-                'roll5_adj_firsttower': a_feats.get('roll5_adj_firsttower', 0) - b_feats.get('roll5_adj_firsttower', 0), 
-                'roll5_adj_firstbaron': a_feats.get('roll5_adj_firstbaron', 0) - b_feats.get('roll5_adj_firstbaron', 0), 
-                'roll5_adj_dpm': a_feats.get('roll5_adj_dpm', 0) - b_feats.get('roll5_adj_dpm', 0), 
-                'roll5_adj_vspm': a_feats.get('roll5_adj_vspm', 0) - b_feats.get('roll5_adj_vspm', 0)
-            }])
+            # Check feature generation — dual timescale (V3.1) vs single (V3) vs legacy (V2)
+            has_dual_deltas = 'delta5_adj_golddiffat15' in model_df.columns
+            has_single_deltas = 'delta_adj_golddiffat15' in model_df.columns
             
-            # Since the model expects absolute stats (not differential) we should pass absolute team stats:
-            x_input = pd.DataFrame([{
-                'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1,
-                'roll5_opp_elo_pre': a_feats.get('roll5_opp_elo_pre', avg_b),
-                'roll5_adj_golddiffat15': a_feats.get('roll5_adj_golddiffat15', 0), 
-                'roll5_adj_xpdiffat15': a_feats.get('roll5_adj_xpdiffat15', 0), 
-                'roll5_adj_csdiffat15': a_feats.get('roll5_adj_csdiffat15', 0), 
-                'roll5_adj_firstblood': a_feats.get('roll5_adj_firstblood', 0), 
-                'roll5_adj_firstdragon': a_feats.get('roll5_adj_firstdragon', 0), 
-                'roll5_adj_firstherald': a_feats.get('roll5_adj_firstherald', 0), 
-                'roll5_adj_firsttower': a_feats.get('roll5_adj_firsttower', 0), 
-                'roll5_adj_firstbaron': a_feats.get('roll5_adj_firstbaron', 0), 
-                'roll5_adj_dpm': a_feats.get('roll5_adj_dpm', 0), 
-                'roll5_adj_vspm': a_feats.get('roll5_adj_vspm', 0)
-            }])
+            stat_names = ['adj_golddiffat15', 'adj_xpdiffat15', 'adj_csdiffat15',
+                          'adj_firstblood', 'adj_firstdragon', 'adj_firstherald',
+                          'adj_firsttower', 'adj_firstbaron', 'adj_dpm', 'adj_vspm', 'opp_elo_pre']
+            
+            if has_dual_deltas:
+                # V3.1: Dual-timescale delta features
+                row = {'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1}
+                for s in stat_names:
+                    a5 = a_feats.get(f'roll5_{s}', 0)
+                    b5 = b_feats.get(f'roll5_{s}', 0)
+                    a10 = a_feats.get(f'roll10_{s}', 0)
+                    b10 = b_feats.get(f'roll10_{s}', 0)
+                    row[f'delta5_{s}'] = a5 - b5
+                    row[f'delta10_{s}'] = a10 - b10
+                x_input = pd.DataFrame([row])
+            elif has_single_deltas:
+                # V3: Single-timescale delta features
+                row = {'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1}
+                for s in stat_names:
+                    row[f'delta_{s}'] = a_feats.get(f'roll5_{s}', 0) - b_feats.get(f'roll5_{s}', 0)
+                x_input = pd.DataFrame([row])
+            else:
+                # V2 fallback: absolute team stats
+                x_input = pd.DataFrame([{
+                    'team_elo_pre': avg_a, 'opp_elo_pre': avg_b, 'expected_win_prob': p_a, 'is_blue_side': 1,
+                    'roll5_opp_elo_pre': a_feats.get('roll5_opp_elo_pre', avg_b),
+                    'roll5_adj_golddiffat15': a_feats.get('roll5_adj_golddiffat15', 0),
+                    'roll5_adj_xpdiffat15': a_feats.get('roll5_adj_xpdiffat15', 0),
+                    'roll5_adj_csdiffat15': a_feats.get('roll5_adj_csdiffat15', 0),
+                    'roll5_adj_firstblood': a_feats.get('roll5_adj_firstblood', 0),
+                    'roll5_adj_firstdragon': a_feats.get('roll5_adj_firstdragon', 0),
+                    'roll5_adj_firstherald': a_feats.get('roll5_adj_firstherald', 0),
+                    'roll5_adj_firsttower': a_feats.get('roll5_adj_firsttower', 0),
+                    'roll5_adj_firstbaron': a_feats.get('roll5_adj_firstbaron', 0),
+                    'roll5_adj_dpm': a_feats.get('roll5_adj_dpm', 0),
+                    'roll5_adj_vspm': a_feats.get('roll5_adj_vspm', 0),
+                }])
             
             p_a_ml_blue = ml_model.predict_proba(x_input)[:, 1][0]
             

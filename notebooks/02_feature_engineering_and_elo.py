@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Feature Engineering & Point-in-Time Dataset Generation
-# In this notebook, we apply two major pipelines to our raw Oracle's Elixir data to prepare it for XGBoost:
-# 1. **Contextual Rolling Stats**: Calculate team performance metrics (e.g., Gold diff at 15, First Dragon %, etc.) over their last $N$ games *prior* to the current match (to prevent data leakage).
-# 2. **The Global ELO Engine**: Process every match chronologically, pushing players through our Tiered Bipartite ELO system and extracting their pre-match ELO to generate $P(Win_{ELO})$. 
-# 
-# Finally, we merge these together to form our ultimate training dataset.
+# # Feature Engineering & Point-in-Time Dataset Generation (V3)
+# Overhauled pipeline with:
+# 1. **Dynamic Regional Gravity** — regional baselines shift after international events
+# 2. **Sigmoid SOS Multiplier** — non-linear strength-of-schedule adjustment
+# 3. **Symmetric Feature Deltas** — XGBoost sees team A stats *relative to* team B
+# 4. **Cross-Regional K-Factor** — international matches learn 2x faster
+# 5. **Softened Decay** — 0.1% daily, capped at 50 ELO max
 
 # In[1]:
 
@@ -38,20 +39,7 @@ df_all = df_all.sort_values(by='date').reset_index(drop=True)
 print(f"Loaded {len(df_all)} total rows (includes 2026 data!).")
 
 
-# ## 1. Rolling Team Stats
-# Oracle's Elixir luckily provides a `team` row per team per game that pre-aggregates many useful stats.
-# We will compute the rolling average for the 5 games strictly *prior* to the current game.
-
-# In[3]:
-
-
-print("Moving ELO processing UP in the pipeline so we can use ELO as an SOS multiplier for rolling stats...")
-
-
-# In[5]:
-
-
-
+# ## 1. ELO Engine (runs first — we need opponent ELO for SOS)
 
 # In[12]:
 
@@ -64,23 +52,23 @@ match_results = df_all[df_all['position'] == 'team']
 players_df = df_all[df_all['position'] != 'team'][['gameid', 'teamid', 'playerid', 'playername']]
 
 grouped_players = players_df.groupby(['gameid', 'teamid'])['playerid'].apply(list).reset_index()
-# Index for faster lookup
 grouped_players_dict = grouped_players.set_index(['gameid', 'teamid'])['playerid'].to_dict()
 
 engine_stats = []
 
-# Process all matches (we will use tqdm to show progress)
+# Track international event deltas for Dynamic Regional Gravity
+current_event = None
+event_player_elos_pre = {}  # {player_id: elo_before_event}
+
 for name, group in tqdm(match_results.groupby('gameid', sort=False), desc="Processing Matches"):
     if len(group) != 2:
         continue
 
-    # Needs to be sorted natively by groupby but we already sorted df_all upfront
     date = group['date'].iloc[0]
     league = group['league'].iloc[0]
 
     team_a = group.iloc[0]
     team_b = group.iloc[1]
-
     team_a_won = bool(team_a['result'])
 
     key_a = (name, team_a['teamid'])
@@ -93,10 +81,46 @@ for name, group in tqdm(match_results.groupby('gameid', sort=False), desc="Proce
     players_b = grouped_players_dict[key_b]
 
     if len(players_a) != 5 or len(players_b) != 5:
-        continue # we only want pure 5v5 matches for the ELO system
+        continue
+
+    # --- Dynamic Regional Gravity: track event transitions ---
+    if elo_engine.is_tournament(league):
+        if current_event != league:
+            # New tournament started — snapshot pre-event ELOs
+            if current_event is not None and event_player_elos_pre:
+                # Previous event just ended — compute deltas and update baselines
+                deltas = {}
+                for pid, pre_elo in event_player_elos_pre.items():
+                    if pid in elo_engine.players:
+                        deltas[pid] = elo_engine.players[pid]['elo'] - pre_elo
+                if deltas:
+                    elo_engine.recalculate_league_baselines(deltas)
+            current_event = league
+            event_player_elos_pre = {}
+        # Snapshot first appearance in this event
+        for pid in players_a + players_b:
+            if pid not in event_player_elos_pre and pid in elo_engine.players:
+                event_player_elos_pre[pid] = elo_engine.players[pid]['elo']
+    else:
+        # Domestic match — if we were in a tournament, finalize it
+        if current_event is not None and event_player_elos_pre:
+            deltas = {}
+            for pid, pre_elo in event_player_elos_pre.items():
+                if pid in elo_engine.players:
+                    deltas[pid] = elo_engine.players[pid]['elo'] - pre_elo
+            if deltas:
+                elo_engine.recalculate_league_baselines(deltas)
+            current_event = None
+            event_player_elos_pre = {}
 
     # Process through Engine
     result_elo = elo_engine.process_match(date, league, players_a, players_b, team_a_won)
+
+    # Snapshot first appearance for new tournament players (post-init)
+    if elo_engine.is_tournament(league):
+        for pid in players_a + players_b:
+            if pid not in event_player_elos_pre:
+                event_player_elos_pre[pid] = elo_engine.players[pid]['elo']
 
     # Store for Team A
     engine_stats.append({
@@ -116,14 +140,26 @@ for name, group in tqdm(match_results.groupby('gameid', sort=False), desc="Proce
         'expected_win_prob': result_elo['expected_b'],
     })
 
+# Finalize any remaining open event
+if current_event is not None and event_player_elos_pre:
+    deltas = {}
+    for pid, pre_elo in event_player_elos_pre.items():
+        if pid in elo_engine.players:
+            deltas[pid] = elo_engine.players[pid]['elo'] - pre_elo
+    if deltas:
+        elo_engine.recalculate_league_baselines(deltas)
+
 elo_df = pd.DataFrame(engine_stats)
 print(f"Processed ELOs for {len(elo_df) // 2} games.")
+print(f"Regional baseline shifts: {elo_engine.regional_baseline_shifts}")
 
+
+# ## 2. Sigmoid SOS + Rolling Stats + Symmetric Deltas
 
 # In[14]:
 
 
-# 3. Create SOS Adjusted Team Stats
+# 3. Create SOS Adjusted Team Stats with Sigmoid multiplier
 team_df = df_all[df_all['position'] == 'team'].copy()
 
 # Base stat columns
@@ -133,52 +169,96 @@ stat_cols = [
     'dpm', 'vspm'
 ]
 
-# Convert strings to numeric
 for c in stat_cols:
     team_df[c] = pd.to_numeric(team_df[c], errors='coerce').fillna(0)
 
-# Merge ELO so we know the opponent's ELO for each match
+# Merge ELO
 team_with_elo = pd.merge(team_df, elo_df, on=['gameid', 'teamid'], how='inner')
 
-# Create SOS multiplier. We divide by 1500 (average ELO). 
-# If opponent ELO is 1650, multiplier is 1.1 (Stats worth 10% more)
-# If opponent ELO is 1350, multiplier is 0.9 (Stats worth 10% less)
-team_with_elo['sos_multiplier'] = team_with_elo['opp_elo_pre'] / 1500.0
+# --- Sigmoid SOS Multiplier ---
+# Centered at 1500, with alpha=0.004 controlling steepness
+# sos(1300) ≈ 0.69, sos(1500) = 1.00, sos(1650) ≈ 1.22, sos(1800) ≈ 1.43
+SOS_ALPHA = 0.004
+team_with_elo['sos_multiplier'] = 2.0 / (1.0 + np.exp(-SOS_ALPHA * (team_with_elo['opp_elo_pre'] - 1500.0)))
 
-# Adjust stats that should be scaled by opponent strength
-# Values like golddiff, xpdiff, csdiff, dpm. 
-# For booleans (firstblood etc), scaling makes them "expected value", so 1 kill against strong team = 1.1 FirstBlood points
+# Adjust stats by SOS
 adjusted_cols = []
 for c in stat_cols:
-    if c != 'gamelength': # don't SOS adjust time itself
+    if c != 'gamelength':
         adj_col = f'adj_{c}'
         team_with_elo[adj_col] = team_with_elo[c] * team_with_elo['sos_multiplier']
         adjusted_cols.append(adj_col)
 
-# We also want to track the rolling average of the opponent's ELO
 adjusted_cols.append('opp_elo_pre')
 
-# Calculate rolling averages (shifted by 1 to prevent data leak)
-def rolling_mean_ignore_leak(x):
-    return x.shift(1).rolling(window=5, min_periods=1).mean()
+# Rolling 5-game averages (shifted by 1 to prevent data leak)
+def rolling_mean_ignore_leak(x, window):
+    return x.shift(1).rolling(window=window, min_periods=1).mean()
 
-# Apply grouping
-rolling_stats = team_with_elo.groupby('teamid')[adjusted_cols].transform(rolling_mean_ignore_leak)
-rolling_stats.columns = [f'roll5_{c}' for c in adjusted_cols]
+rolling5 = team_with_elo.groupby('teamid')[adjusted_cols].transform(rolling_mean_ignore_leak, window=5)
+rolling5.columns = [f'roll5_{c}' for c in adjusted_cols]
 
-# Build Final DF
-model_df_v2 = pd.concat([
-    team_with_elo[['gameid', 'teamid', 'side', 'result', 'team_elo_pre', 'opp_elo_pre', 'expected_win_prob']], 
+rolling10 = team_with_elo.groupby('teamid')[adjusted_cols].transform(rolling_mean_ignore_leak, window=10)
+rolling10.columns = [f'roll10_{c}' for c in adjusted_cols]
+
+rolling_stats = pd.concat([rolling5, rolling10], axis=1)
+
+# Build per-team feature rows
+team_features = pd.concat([
+    team_with_elo[['gameid', 'teamid', 'side', 'result', 'team_elo_pre', 'opp_elo_pre', 'expected_win_prob']],
     rolling_stats
 ], axis=1)
 
-# Drop initial NA rows
+team_features.dropna(inplace=True)
+
+# --- Symmetric Deltas ---
+# Self-join each game to pair Team A features with Team B features
+# Each gameid has exactly 2 rows. We merge on gameid, cross-joining the pair.
+delta_cols = [c for c in rolling_stats.columns]  # includes both roll5_* and roll10_*
+
+# Create opponent lookup: for each (gameid, teamid), find the opponent's row
+opp_features = team_features[['gameid', 'teamid'] + delta_cols].copy()
+opp_features.columns = ['gameid', 'opp_teamid'] + [f'opp_{c}' for c in delta_cols]
+
+# For each gameid, pair each team with the OTHER team's features
+game_pairs = team_features[['gameid', 'teamid']].copy()
+opp_map = team_with_elo[['gameid', 'teamid']].drop_duplicates()
+
+# Build opponent teamid mapping per game
+def build_opp_map(game_teams):
+    """For each (gameid, teamid), find the OTHER teamid in the same game."""
+    opp_rows = []
+    for gid, grp in game_teams.groupby('gameid'):
+        tids = grp['teamid'].tolist()
+        if len(tids) == 2:
+            opp_rows.append({'gameid': gid, 'teamid': tids[0], 'opp_teamid': tids[1]})
+            opp_rows.append({'gameid': gid, 'teamid': tids[1], 'opp_teamid': tids[0]})
+    return pd.DataFrame(opp_rows)
+
+opp_mapping = build_opp_map(opp_map)
+
+# Merge to get opponent's rolling stats alongside each team's row
+model_df_v2 = pd.merge(team_features, opp_mapping, on=['gameid', 'teamid'], how='inner')
+model_df_v2 = pd.merge(model_df_v2, opp_features, on=['gameid', 'opp_teamid'], how='inner')
+
+# Compute deltas: team's rolling stat minus opponent's rolling stat
+for col in delta_cols:
+    # roll5_adj_golddiffat15 -> delta5_adj_golddiffat15, roll10_adj_X -> delta10_adj_X
+    delta_name = col.replace('roll5_', 'delta5_').replace('roll10_', 'delta10_')
+    model_df_v2[delta_name] = model_df_v2[col] - model_df_v2[f'opp_{col}']
+
+# Drop raw opponent columns (keep deltas + team's own rolling stats for reference)
+opp_cols_to_drop = [f'opp_{c}' for c in delta_cols] + ['opp_teamid']
+model_df_v2.drop(columns=opp_cols_to_drop, inplace=True)
+
 model_df_v2.dropna(inplace=True)
 
 # Save
 model_df_v2.to_csv('../data/processed/model_features_v2.csv', index=False)
 
 print(f"Final V2 Model Dataset Size: {len(model_df_v2)} team-games.")
+print(f"Delta5 columns: {[c for c in model_df_v2.columns if c.startswith('delta5_')]}")
+print(f"Delta10 columns: {[c for c in model_df_v2.columns if c.startswith('delta10_')]}")
 model_df_v2.head()
 
 
@@ -191,12 +271,10 @@ recent_rosters = players_df.sort_values(by='gameid').groupby('teamid').tail(5)
 team_elos = []
 for teamid, group in recent_rosters.groupby('teamid'):
     if len(group) == 5:
-        # Get team name and league from match_results
         team_info = match_results[match_results['teamid'] == teamid].iloc[-1]
         teamname = team_info['teamname']
         league = team_info['league']
 
-        # Calculate current aggregate ELO of these 5 players
         elos = [elo_engine.players.get(pid, {}).get('elo', 1500) for pid in group['playerid']]
         current_team_elo = sum(elos) / 5.0
 

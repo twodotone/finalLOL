@@ -1,4 +1,5 @@
-import os
+
+python -m streamlit run src/app.pyimport os
 import pandas as pd
 from features.elo import PlayerEloSystem
 from cli_predictor import build_elo_engine, find_team
@@ -30,3 +31,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
