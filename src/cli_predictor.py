@@ -114,7 +114,8 @@ def build_elo_engine(data_dir):
     print("Loading datasets...", end="", flush=True)
     files = [f for f in glob.glob(os.path.join(data_dir, '*.csv')) if not f.endswith('.bak')]
     
-    dfs = [pd.read_csv(f, low_memory=False) for f in sorted(files)]
+    req_cols = {'gameid', 'teamid', 'teamname', 'playerid', 'playername', 'position', 'date', 'league', 'result'}
+    dfs = [pd.read_csv(f, usecols=lambda c: c in req_cols, low_memory=False) for f in sorted(files)]
     df_all = pd.concat(dfs, ignore_index=True)
     df_all['date'] = pd.to_datetime(df_all['date'])
     df_all = df_all.sort_values(by='date').reset_index(drop=True)
