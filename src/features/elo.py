@@ -16,15 +16,40 @@ class PlayerEloSystem:
         self.players = {}
 
         # --- Tournament codes (neutral ground — no transfer tax, no baseline) ---
-        self.tournament_leagues = {'MSI', 'WCC', 'EWC', 'WLDs', 'FST', 'DCup', 'ASI', 'Asia Master', 'CCWS'}
+        self.tournament_leagues = {
+            'MSI', 'WCC', 'EWC', 'WLDs', 'FST', 'DCup', 'ASI',
+            'Asia Master', 'CCWS', 'AC', 'Americas Cup',
+            'IC', 'KeSPA', 'LES',  # Iberian Cup, KeSPA Cup, Liga Española
+            'EM', 'EUM',           # EMEA Masters / EU Masters (cross-sub-league)
+        }
 
         # --- Regional Tiers — only domestic leagues ---
+        # Tiers calibrated against Riot GPR regional strength scores:
+        #   LCK: 1586 | LPL: 1353 | LEC: 1169 | LCP: 1156 | LCS: 1084 | CBLOL: 842
         self.league_tiers = {
-            'Tier_1': {'leagues': ['LPL', 'LCK'], 'base_elo': 1600},
-            'Tier_2': {'leagues': ['LEC', 'LCS', 'LTA', 'LTA N', 'LTA S', 'LCP'], 'base_elo': 1500},
-            'Tier_3': {'leagues': ['PCS', 'VCS', 'CBLOL', 'LLA'], 'base_elo': 1450},
-            'Tier_4': {'leagues': ['LFL', 'NACL', 'AL', 'LCKC', 'LDL', 'LJL', 'TCL', 'LVP SL', 'PRM'], 'base_elo': 1400},
-            'Tier_5': {'base_elo': 1350}
+            'Tier_S':  {'leagues': ['LCK'], 'base_elo': 1625},
+            'Tier_1':  {'leagues': ['LPL'], 'base_elo': 1575},
+            'Tier_2':  {'leagues': ['LEC', 'LCP'], 'base_elo': 1500},
+            'Tier_2b': {'leagues': ['LCS', 'LTA', 'LTA N', 'LTA S'], 'base_elo': 1475},
+            'Tier_3':  {'leagues': ['PCS', 'VCS', 'CBLOL', 'LLA'], 'base_elo': 1425},
+            # Minor leagues: single flat baseline.  We have no empirical
+            # evidence to differentiate these tiers, so a shared baseline
+            # prevents phantom edges between poorly-connected leagues.
+            'Tier_Minor':  {'leagues': [
+                # Former Tier 4
+                'LFL', 'NACL', 'AL', 'LCKC', 'LDL', 'LJL', 'TCL',
+                'LVP SL', 'PRM', 'NLC', 'LAS',
+                'LCO', 'LCSA', 'LJLA', 'CBLOLA', 'PCL',
+                # Former Tier 5
+                'LFL2', 'LPLOL', 'LIT', 'EBL', 'HM', 'HLL', 'HW',
+                'RL', 'ROL', 'CD', 'CT', 'LRN', 'LRS', 'NEXO',
+                'PRMP', 'HC',
+                'GL', 'GLL', 'GLLPA', 'UL', 'EL', 'EPL', 'ESLOL', 'EBLPA',
+                'NLC Aurora Open',
+                'CDF', 'DDH', 'LCL', 'LHE', 'LMF', 'PGC', 'PGN',
+                'TAL', 'TSC', 'UPL', 'USP', 'VL', 'IGNIS', 'ASCI',
+                'SL (LATAM)',
+            ], 'base_elo': 1350},
         }
 
         # Flatten for fast lookup
@@ -48,7 +73,7 @@ class PlayerEloSystem:
         """Returns the current regional baseline including any dynamic shifts."""
         if league in self.tournament_leagues:
             return 1500  # tournaments don't have their own baseline
-        base = self.league_base_elo.get(league, self.league_tiers['Tier_5']['base_elo'])
+        base = self.league_base_elo.get(league, self.league_tiers['Tier_Minor']['base_elo'])
         shift = self.regional_baseline_shifts.get(league, 0.0)
         return base + shift
 
@@ -92,6 +117,7 @@ class PlayerEloSystem:
         self.players[player_id] = {
             'elo': base_elo,
             'games_played': 0,
+            'intl_games_played': 0,
             'last_played': date,
             'home_league': home
         }
@@ -130,8 +156,14 @@ class PlayerEloSystem:
             old_base = self.get_league_base_elo(old_home)
             new_base = self.get_league_base_elo(effective_league)
 
-            if new_base > old_base:
-                surplus = player['elo'] - old_base
+            # --- Transfer Tax (Refined) ---
+            # If moving to a region with a DIFFERENT baseline, we apply a 25% tax 
+            # to any surplus relative to the competitive environment.
+            if new_base != old_base:
+                # If moving UP, tax surplus relative to OLD baseline (prevents carrying minor surplus).
+                # If moving DOWN, tax surplus relative to NEW baseline (prevents major stars from overwhelming).
+                target_base = old_base if new_base > old_base else new_base
+                surplus = player['elo'] - target_base
                 if surplus > 0:
                     player['elo'] -= surplus * 0.25
 
@@ -155,19 +187,56 @@ class PlayerEloSystem:
         self.players[player_id]['games_played'] += 1
         self.players[player_id]['last_played'] = current_date
 
-    def get_k_factor(self, player_id, is_cross_region=False):
+    def increment_intl_games(self, player_id):
+        """Call after processing a tournament match to track intl experience."""
+        if player_id in self.players:
+            self.players[player_id]['intl_games_played'] = (
+                self.players[player_id].get('intl_games_played', 0) + 1
+            )
+
+    def get_player_intl_games(self, player_id):
+        """Return how many international/tournament games this player has."""
+        if player_id in self.players:
+            return self.players[player_id].get('intl_games_played', 0)
+        return 0
+
+    def get_k_factor(self, player_id, is_cross_region=False, opp_avg_elo=None):
         """
-        K-factor with placement boost and international multiplier.
+        K-factor with placement boost and data-driven skill gap adjustments.
         - Placement players (< placement_matches games): placement_k
-        - Cross-regional international matches: base_k * intl_k_multiplier
-        - Standard domestic matches: base_k
+        - Data-Driven Gravity: Removes manual ad-hoc assumptions and drives K 
+          based natively on the actual competitive gap (opp_avg_elo - player_elo).
+        - If an underdog plays against a significantly higher ELO team, their K 
+          dynamically scales to catch them up.
         """
         if self.players[player_id]['games_played'] < self.placement_matches:
             k = self.placement_k
         else:
             k = self.base_k
-        if is_cross_region:
-            k *= self.intl_k_multiplier
+
+        if opp_avg_elo is not None:
+            player_elo = self.players[player_id]['elo']
+            
+            # 1. Natural Skill Gap Acceleration
+            # Only underdogs get the massive K-factor boost to catch up rapidly. 
+            # We remove abs() to prevent favorites from getting boosted K factors.
+            elo_gap = opp_avg_elo - player_elo
+            if elo_gap > 100:
+                # Scale up linearly starting from 100 ELO gap, maxing at 2.5x
+                gap_boost = min(2.5, 1.0 + (elo_gap - 100) / 200.0)
+                k *= gap_boost
+            
+            # 2. International multiplier restricted to major leagues
+            # Prevents minor leagues from farming K simply by playing in weak CCWS/EM tournaments.
+            if is_cross_region:
+                if player_elo > 1450 and opp_avg_elo > 1450:
+                    k *= self.intl_k_multiplier
+        else:
+            if is_cross_region:
+                player_elo = self.players[player_id]['elo']
+                if player_elo > 1450:
+                    k *= self.intl_k_multiplier
+
         return k
 
     def calculate_expected_score(self, team_a_elo, team_b_elo):
@@ -207,7 +276,7 @@ class PlayerEloSystem:
         avg_a_elo = sum(team_a_elos.values()) / len(team_a_elos)
         avg_b_elo = sum(team_b_elos.values()) / len(team_b_elos)
 
-        # Expected scores
+        # Expected scores for the team overall (used for tracking/returns)
         expected_a = self.calculate_expected_score(avg_a_elo, avg_b_elo)
         expected_b = 1 - expected_a
 
@@ -215,20 +284,29 @@ class PlayerEloSystem:
         actual_a = 1 if team_a_won else 0
         actual_b = 0 if team_a_won else 1
 
-        # Update players
+        # Update players using INDIVIDUAL expected scores against opponent average
+        # This prevents "smurf" inflation where a high ELO player on a weak team
+        # gains too much ELO because the team average dragged expectations down.
         updated_a = {}
         for pid, elo in team_a_elos.items():
-            k = self.get_k_factor(pid, is_cross_region=is_cross_region)
-            new_elo = elo + k * (actual_a - expected_a)
+            k = self.get_k_factor(pid, is_cross_region=is_cross_region, opp_avg_elo=avg_b_elo)
+            player_expected = self.calculate_expected_score(elo, avg_b_elo)
+            new_elo = elo + k * (actual_a - player_expected)
             self.update_player_elo(pid, new_elo, match_date)
             updated_a[pid] = new_elo
 
         updated_b = {}
         for pid, elo in team_b_elos.items():
-            k = self.get_k_factor(pid, is_cross_region=is_cross_region)
-            new_elo = elo + k * (actual_b - expected_b)
+            k = self.get_k_factor(pid, is_cross_region=is_cross_region, opp_avg_elo=avg_a_elo)
+            player_expected = self.calculate_expected_score(elo, avg_a_elo)
+            new_elo = elo + k * (actual_b - player_expected)
             self.update_player_elo(pid, new_elo, match_date)
             updated_b[pid] = new_elo
+
+        # Track international experience
+        if self.is_tournament(league):
+            for pid in list(team_a_players) + list(team_b_players):
+                self.increment_intl_games(pid)
 
         return {
             'expected_a': expected_a,

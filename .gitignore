@@ -25,3 +25,11 @@ Thumbs.db
 
 # Explicit ignores for temp files
 *.bak
+tmp_*
+*.txt
+*.html
+roster_check.json
+roster_date.json
+kcb_features.json
+kcb_result.json
+tmp_*.json

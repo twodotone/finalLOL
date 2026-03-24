@@ -18,9 +18,11 @@ import glob
 import os
 import sys
 from tqdm import tqdm
+from collections import Counter
 
 sys.path.append('../src')
 from features.elo import PlayerEloSystem
+from features.regional_bridge import RegionalBridge
 
 
 # In[11]:
@@ -28,7 +30,7 @@ from features.elo import PlayerEloSystem
 
 # 1. Load Data
 data_dir = '../data/csv/'
-files = [f for f in glob.glob(os.path.join(data_dir, '*2024*.csv')) + glob.glob(os.path.join(data_dir, '*2025*.csv')) + glob.glob(os.path.join(data_dir, '*2026*.csv')) if not f.endswith('.bak')]
+files = [f for f in glob.glob(os.path.join(data_dir, '*.csv')) if not f.endswith('.bak')]
 
 dfs = [pd.read_csv(f, low_memory=False) for f in files]
 df_all = pd.concat(dfs, ignore_index=True)
@@ -46,6 +48,7 @@ print(f"Loaded {len(df_all)} total rows (includes 2026 data!).")
 
 # 2. Run the ELO Engine FIRST. We need opponent ELO to adjust the raw game stats.
 elo_engine = PlayerEloSystem()
+bridge = RegionalBridge(half_life_days=365, max_adj=0.06, min_effective_games=5.0)
 
 # Separate into games and players
 match_results = df_all[df_all['position'] == 'team']
@@ -122,22 +125,48 @@ for name, group in tqdm(match_results.groupby('gameid', sort=False), desc="Proce
             if pid not in event_player_elos_pre:
                 event_player_elos_pre[pid] = elo_engine.players[pid]['elo']
 
+    # --- Regional Bridge: resolve regions and get pre-match adjustment ---
+    # Determine each team's home region from their players' home leagues
+    homes_a = [elo_engine._get_home_league(pid) for pid in players_a]
+    homes_b = [elo_engine._get_home_league(pid) for pid in players_b]
+    homes_a = [h for h in homes_a if h is not None]
+    homes_b = [h for h in homes_b if h is not None]
+    # Use the most common home league among players
+    region_a = bridge.get_region(Counter(homes_a).most_common(1)[0][0]) if homes_a else None
+    region_b = bridge.get_region(Counter(homes_b).most_common(1)[0][0]) if homes_b else None
+
+    # Get bridge adjustment BEFORE recording this game (point-in-time)
+    bridge_adj_a = bridge.get_bridge_adj(date, region_a, region_b)
+    bridge_adj_b = -bridge_adj_a  # symmetric
+
+    # Record this game if cross-regional
+    if result_elo['is_cross_region'] and region_a and region_b and region_a != region_b:
+        bridge.record_game(date, region_a, region_b,
+                           actual_a=1 if team_a_won else 0,
+                           expected_a=result_elo['expected_a'])
+
     # Store for Team A
+    team_a_intl = sum(elo_engine.get_player_intl_games(pid) for pid in players_a)
     engine_stats.append({
         'gameid': name,
         'teamid': team_a['teamid'],
         'team_elo_pre': result_elo['avg_a_elo_pre'],
         'opp_elo_pre': result_elo['avg_b_elo_pre'],
         'expected_win_prob': result_elo['expected_a'],
+        'regional_bridge_adj': bridge_adj_a,
+        'team_intl_games': team_a_intl,
     })
 
     # Store for Team B
+    team_b_intl = sum(elo_engine.get_player_intl_games(pid) for pid in players_b)
     engine_stats.append({
         'gameid': name,
         'teamid': team_b['teamid'],
         'team_elo_pre': result_elo['avg_b_elo_pre'],
         'opp_elo_pre': result_elo['avg_a_elo_pre'],
         'expected_win_prob': result_elo['expected_b'],
+        'regional_bridge_adj': bridge_adj_b,
+        'team_intl_games': team_b_intl,
     })
 
 # Finalize any remaining open event
@@ -152,6 +181,89 @@ if current_event is not None and event_player_elos_pre:
 elo_df = pd.DataFrame(engine_stats)
 print(f"Processed ELOs for {len(elo_df) // 2} games.")
 print(f"Regional baseline shifts: {elo_engine.regional_baseline_shifts}")
+
+
+# ## 1b. Lane Performance ELO (parallel system)
+
+# In[11b]:
+
+from features.lane_elo import LaneEloSystem
+
+lane_engine = LaneEloSystem()
+
+# Player-level data for lane ELO — need individual stats per position per game
+player_stats = df_all[df_all['position'].isin(['top', 'jng', 'mid', 'bot', 'sup'])].copy()
+for c in ['golddiffat15', 'csdiffat15', 'xpdiffat15', 'kills', 'deaths', 'assists', 'dpm', 'damageshare']:
+    player_stats[c] = pd.to_numeric(player_stats[c], errors='coerce').fillna(0)
+
+# Build lookup: {(gameid, position, teamid): row}
+player_lookup = {}
+for _, row in player_stats.iterrows():
+    player_lookup[(row['gameid'], row['position'], row['teamid'])] = row
+
+# Process lane matchups game by game (must be chronological — df_all is sorted)
+lane_elo_records = []  # will hold per-team-per-game lane ELO snapshots
+
+processed_gameids = []
+for name, group in tqdm(match_results.groupby('gameid', sort=False), desc="Lane ELO"):
+    if len(group) != 2:
+        continue
+
+    date = group['date'].iloc[0]
+    league = group['league'].iloc[0]
+    team_a_id = group.iloc[0]['teamid']
+    team_b_id = group.iloc[1]['teamid']
+
+    # Contextual base ELO for Lane ELO initialization
+    match_base_elo = elo_engine.get_league_base_elo(league) if not elo_engine.is_tournament(league) else 1500
+
+    # Collect lane ELOs BEFORE update (pre-match snapshot)
+    lane_elos_a = {}
+    lane_elos_b = {}
+
+    for pos in LaneEloSystem.POSITIONS:
+        key_a = (name, pos, team_a_id)
+        key_b = (name, pos, team_b_id)
+
+        if key_a not in player_lookup or key_b not in player_lookup:
+            continue
+
+        row_a = player_lookup[key_a]
+        row_b = player_lookup[key_b]
+
+        pid_a = row_a['playerid']
+        pid_b = row_b['playerid']
+
+        # Snapshot pre-match lane ELOs
+        lane_elos_a[pos] = lane_engine.get_lane_elo(pid_a, date, base_elo=match_base_elo)
+        lane_elos_b[pos] = lane_engine.get_lane_elo(pid_b, date, base_elo=match_base_elo)
+
+        # Process the matchup (updates both players)
+        lane_engine.process_lane_matchup(
+            date, pid_a, pid_b,
+            golddiff15=row_a['golddiffat15'], csdiff15=row_a['csdiffat15'],
+            xpdiff15=row_a['xpdiffat15'],
+            kills=row_a['kills'], deaths=row_a['deaths'],
+            assists=row_a['assists'],
+            dpm=row_a['dpm'], damageshare=row_a['damageshare']
+        )
+
+    # Only record if we got all 5 positions
+    if len(lane_elos_a) == 5 and len(lane_elos_b) == 5:
+        # Team A record
+        rec_a = {'gameid': name, 'teamid': team_a_id}
+        for pos in LaneEloSystem.POSITIONS:
+            rec_a[f'lane_elo_{pos}'] = lane_elos_a[pos]
+        lane_elo_records.append(rec_a)
+
+        # Team B record
+        rec_b = {'gameid': name, 'teamid': team_b_id}
+        for pos in LaneEloSystem.POSITIONS:
+            rec_b[f'lane_elo_{pos}'] = lane_elos_b[pos]
+        lane_elo_records.append(rec_b)
+
+lane_elo_df = pd.DataFrame(lane_elo_records)
+print(f"Lane ELO computed for {len(lane_elo_df) // 2} games across 5 positions.")
 
 
 # ## 2. Sigmoid SOS + Rolling Stats + Symmetric Deltas
@@ -175,18 +287,19 @@ for c in stat_cols:
 # Merge ELO
 team_with_elo = pd.merge(team_df, elo_df, on=['gameid', 'teamid'], how='inner')
 
-# --- Sigmoid SOS Multiplier ---
-# Centered at 1500, with alpha=0.004 controlling steepness
-# sos(1300) ≈ 0.69, sos(1500) = 1.00, sos(1650) ≈ 1.22, sos(1800) ≈ 1.43
-SOS_ALPHA = 0.004
-team_with_elo['sos_multiplier'] = 2.0 / (1.0 + np.exp(-SOS_ALPHA * (team_with_elo['opp_elo_pre'] - 1500.0)))
+# We removed the Sigmoid SOS Multiplier because it distorted symmetric stats (like golddiff)
+# by multiplying negative values against good teams, making them massively negative,
+# which confused the XGBoost model into thinking massively negative = good team.
+# Instead, we just pass the raw stats and let the model contextualize them
+# using the 'opp_elo_pre' rolling averages which are included as features.
 
-# Adjust stats by SOS
 adjusted_cols = []
 for c in stat_cols:
     if c != 'gamelength':
+        # Keep the 'adj_' prefix for backward compatibility with feature names,
+        # but don't actually modify the stat.
         adj_col = f'adj_{c}'
-        team_with_elo[adj_col] = team_with_elo[c] * team_with_elo['sos_multiplier']
+        team_with_elo[adj_col] = team_with_elo[c]
         adjusted_cols.append(adj_col)
 
 adjusted_cols.append('opp_elo_pre')
@@ -201,11 +314,14 @@ rolling5.columns = [f'roll5_{c}' for c in adjusted_cols]
 rolling10 = team_with_elo.groupby('teamid')[adjusted_cols].transform(rolling_mean_ignore_leak, window=10)
 rolling10.columns = [f'roll10_{c}' for c in adjusted_cols]
 
-rolling_stats = pd.concat([rolling5, rolling10], axis=1)
+rolling30 = team_with_elo.groupby('teamid')[adjusted_cols].transform(rolling_mean_ignore_leak, window=30)
+rolling30.columns = [f'roll30_{c}' for c in adjusted_cols]
+
+rolling_stats = pd.concat([rolling5, rolling10, rolling30], axis=1)
 
 # Build per-team feature rows
 team_features = pd.concat([
-    team_with_elo[['gameid', 'teamid', 'side', 'result', 'team_elo_pre', 'opp_elo_pre', 'expected_win_prob']],
+    team_with_elo[['gameid', 'teamid', 'side', 'result', 'team_elo_pre', 'opp_elo_pre', 'expected_win_prob', 'regional_bridge_adj', 'team_intl_games']],
     rolling_stats
 ], axis=1)
 
@@ -244,12 +360,66 @@ model_df_v2 = pd.merge(model_df_v2, opp_features, on=['gameid', 'opp_teamid'], h
 # Compute deltas: team's rolling stat minus opponent's rolling stat
 for col in delta_cols:
     # roll5_adj_golddiffat15 -> delta5_adj_golddiffat15, roll10_adj_X -> delta10_adj_X
-    delta_name = col.replace('roll5_', 'delta5_').replace('roll10_', 'delta10_')
+    delta_name = col.replace('roll5_', 'delta5_').replace('roll10_', 'delta10_').replace('roll30_', 'delta30_')
     model_df_v2[delta_name] = model_df_v2[col] - model_df_v2[f'opp_{col}']
 
 # Drop raw opponent columns (keep deltas + team's own rolling stats for reference)
 opp_cols_to_drop = [f'opp_{c}' for c in delta_cols] + ['opp_teamid']
 model_df_v2.drop(columns=opp_cols_to_drop, inplace=True)
+
+# --- Lane ELO Matchup Features ---
+# Merge lane ELOs for the team AND the opponent, then compute per-position diffs
+if len(lane_elo_df) > 0:
+    lane_cols = [f'lane_elo_{pos}' for pos in LaneEloSystem.POSITIONS]
+
+    # Re-derive the opponent mapping for model_df_v2
+    opp_mapping_lane = build_opp_map(team_with_elo[['gameid', 'teamid']].drop_duplicates())
+
+    # Merge team's lane ELOs
+    model_df_v2 = pd.merge(model_df_v2, lane_elo_df, on=['gameid', 'teamid'], how='left')
+
+    # Merge opponent's lane ELOs
+    opp_lane = lane_elo_df.rename(columns={c: f'opp_{c}' for c in lane_cols})
+    opp_lane = opp_lane.rename(columns={'teamid': 'opp_teamid'})
+    model_df_v2 = pd.merge(model_df_v2, opp_mapping_lane, on=['gameid', 'teamid'], how='left')
+    model_df_v2 = pd.merge(model_df_v2, opp_lane, on=['gameid', 'opp_teamid'], how='left')
+
+    # Compute lane matchup deltas (positive = our player is stronger)
+    for pos in LaneEloSystem.POSITIONS:
+        model_df_v2[f'lane_delta_{pos}'] = (
+            model_df_v2[f'lane_elo_{pos}'] - model_df_v2[f'opp_lane_elo_{pos}']
+        )
+
+    # Aggregate features: overall lane advantage + weakest-link
+    lane_delta_cols = [f'lane_delta_{pos}' for pos in LaneEloSystem.POSITIONS]
+    model_df_v2['lane_delta_avg'] = model_df_v2[lane_delta_cols].mean(axis=1)
+    model_df_v2['lane_delta_worst'] = model_df_v2[lane_delta_cols].min(axis=1)
+
+    # Drop intermediate opponent columns, keep lane deltas + raw lane ELOs + aggregates
+    drop_lane = ([f'opp_lane_elo_{pos}' for pos in LaneEloSystem.POSITIONS]
+                 + ['opp_teamid'])
+    model_df_v2.drop(columns=[c for c in drop_lane if c in model_df_v2.columns], inplace=True)
+
+    lane_feature_names = lane_delta_cols + ['lane_delta_avg', 'lane_delta_worst']
+    print(f"Lane matchup features added: {lane_feature_names}")
+else:
+    print("WARNING: No lane ELO data — skipping lane features.")
+    lane_feature_names = []
+
+# --- Cross-League Confidence Features ---
+# Compute opponent's intl games and then delta/min features
+if 'team_intl_games' in model_df_v2.columns:
+    # Re-derive opp mapping if needed
+    opp_mapping_intl = build_opp_map(team_with_elo[['gameid', 'teamid']].drop_duplicates())
+    opp_intl = team_with_elo[['gameid', 'teamid', 'team_intl_games']].copy()
+    opp_intl = opp_intl.rename(columns={'teamid': 'opp_teamid', 'team_intl_games': 'opp_intl_games'})
+    model_df_v2 = pd.merge(model_df_v2, opp_mapping_intl, on=['gameid', 'teamid'], how='left')
+    model_df_v2 = pd.merge(model_df_v2, opp_intl, on=['gameid', 'opp_teamid'], how='left')
+    model_df_v2['opp_intl_games'] = model_df_v2['opp_intl_games'].fillna(0)
+    model_df_v2['min_cross_league_games'] = model_df_v2[['team_intl_games', 'opp_intl_games']].min(axis=1)
+    model_df_v2['delta_cross_league_games'] = model_df_v2['team_intl_games'] - model_df_v2['opp_intl_games']
+    model_df_v2.drop(columns=['opp_teamid', 'opp_intl_games'], inplace=True, errors='ignore')
+    print(f"Cross-league confidence features added: min_cross_league_games, delta_cross_league_games")
 
 model_df_v2.dropna(inplace=True)
 
@@ -259,6 +429,7 @@ model_df_v2.to_csv('../data/processed/model_features_v2.csv', index=False)
 print(f"Final V2 Model Dataset Size: {len(model_df_v2)} team-games.")
 print(f"Delta5 columns: {[c for c in model_df_v2.columns if c.startswith('delta5_')]}")
 print(f"Delta10 columns: {[c for c in model_df_v2.columns if c.startswith('delta10_')]}")
+print(f"Lane columns: {[c for c in model_df_v2.columns if c.startswith('lane_delta')]}")
 model_df_v2.head()
 
 
@@ -360,7 +531,7 @@ def project_matchup(team_a_name, team_b_name, series_format='BO1'):
         pname = players_df[players_df['playerid'] == pid]['playername'].iloc[-1] if pid in players_df['playerid'].values else pid
         print(f"    - {pname:<28} {elo:.1f}")
 
-    print(f"\n{'─'*55}")
+    print(f"\n{'-'*55}")
     print(f"  ELO Differential: {elo_diff:+.1f} in favor of {a_name if elo_diff > 0 else b_name}")
     print(f"\n  Per-Game Win Prob:  {a_name} {p_a_win_game*100:.1f}%  |  {b_name} {p_b_win_game*100:.1f}%")
     print(f"  {series_format} Series Win Prob:  {a_name} {p_a_series*100:.1f}%  |  {b_name} {p_b_series*100:.1f}%")
@@ -405,7 +576,7 @@ def analyze_polymarket_edge(model_p_win_game, market_lines, series_format='BO3',
     print(f"  Model per-game P(BLG win): {p*100:.1f}%")
     print(f"{'='*60}")
     print(f"  {'Market':<42} {'Model':>7} {'Market':>8} {'Edge':>7} {'Half-Kelly':>11}")
-    print(f"  {'─'*42} {'─'*7} {'─'*8} {'─'*7} {'─'*11}")
+    print(f"  {'-'*42} {'-'*7} {'-'*8} {'-'*7} {'-'*11}")
 
     for market_name, market_price in market_lines.items():
         model_prob = model_probs.get(market_name)

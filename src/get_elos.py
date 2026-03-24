@@ -1,12 +1,12 @@
 
-python -m streamlit run src/app.pyimport os
+import os
 import pandas as pd
 from features.elo import PlayerEloSystem
 from cli_predictor import build_elo_engine, find_team
 
 def main():
     data_dir = os.path.join(os.path.dirname(__file__), '..', 'data', 'csv')
-    elo_engine, match_results, players_df = build_elo_engine(data_dir)
+    elo_engine, bridge, match_results, players_df = build_elo_engine(data_dir)
 
     def get_team_elo(team_str):
         name = find_team(team_str, match_results)

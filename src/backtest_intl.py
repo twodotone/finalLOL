@@ -24,21 +24,31 @@ df = df.sort_values('date')
 # Base ELO + side features
 base_features = ['team_elo_pre', 'opp_elo_pre', 'expected_win_prob', 'is_blue_side']
 
-# Dual-timescale delta features (interleaved: delta5_stat, delta10_stat per stat)
+# Dual-timescale delta features (grouped: all delta5 first, then all delta10)
 _stat_names = ['adj_golddiffat15', 'adj_xpdiffat15', 'adj_csdiffat15',
                'adj_firstblood', 'adj_firstdragon', 'adj_firstherald',
                'adj_firsttower', 'adj_firstbaron', 'adj_dpm', 'adj_vspm', 'opp_elo_pre']
-delta_features_interleaved = []
-for s in _stat_names:
-    delta_features_interleaved.append(f'delta5_{s}')
-    delta_features_interleaved.append(f'delta10_{s}')
+delta_features_grouped = [f'delta5_{s}' for s in _stat_names] + [f'delta10_{s}' for s in _stat_names] + [f'delta30_{s}' for s in _stat_names]
 
 available_cols = set(df_feats.columns)
-dual_available = all(c in available_cols for c in delta_features_interleaved)
+dual_available = all(c in available_cols for c in delta_features_grouped)
+
+# Lane matchup features (V3.2: avg + worst only)
+lane_features = ['lane_delta_avg', 'lane_delta_worst']
+lane_available = all(c in available_cols for c in lane_features)
 
 if dual_available:
-    features = base_features + delta_features_interleaved
-    print('Using dual-timescale DELTA features (V3.1 pipeline)')
+    features = base_features + delta_features_grouped
+    if lane_available:
+        features += lane_features
+        print('Using dual-timescale DELTA + Lane ELO features (V3.2 pipeline)')
+    else:
+        print('Using dual-timescale DELTA features (V3.1 pipeline)')
+    # Cross-league confidence features (V3.3)
+    confidence_features = ['min_cross_league_games', 'delta_cross_league_games']
+    if all(c in available_cols for c in confidence_features):
+        features += confidence_features
+        print('  + Cross-league confidence features (V3.3)')
 else:
     features = base_features + [
         'roll5_opp_elo_pre', 'roll5_adj_golddiffat15', 'roll5_adj_xpdiffat15', 'roll5_adj_csdiffat15',
